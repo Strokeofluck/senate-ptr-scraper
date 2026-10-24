@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # A recovery run may have an older triggering SHA; use current data.
           ref: ${{ github.ref_name }}
