@@ -115,6 +115,7 @@ def build_session() -> requests.Session:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0 Safari/537.36"
             ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
     )
@@ -128,16 +129,24 @@ def get_page_csrf(html: str):
     return token.get("value") if token else None
 
 
+class SenateAccessError(RuntimeError):
+    """The source rejected a request; a fresh session/runner may recover."""
+
+
+def check_senate_response(response: requests.Response, stage: str) -> None:
+    if response.status_code == 403:
+        # Do not log HTML, cookies or CSRF tokens. Distinguish a source-side
+        # edge denial from a Django CSRF rejection without exposing secrets.
+        detail = "access denied by the source"
+        if "csrf" in response.text.lower():
+            detail = "CSRF validation rejected the session"
+        raise SenateAccessError(f"Senate eFD returned HTTP 403 {stage}: {detail}.")
+    response.raise_for_status()
+
+
 def accept_senate_agreement(client: requests.Session) -> str:
-    r = client.get(LANDING_URL, timeout=30)
-
-    if r.status_code == 403:
-        raise RuntimeError(
-            "Senate eFD returned HTTP 403 before the scrape began. "
-            "This usually means the current runner IP is being blocked."
-        )
-
-    r.raise_for_status()
+    r = client.get(LANDING_URL, headers={"Cache-Control": "no-cache"}, timeout=30)
+    check_senate_response(r, "before accepting the agreement")
 
     form_csrf = get_page_csrf(r.text)
     if not form_csrf:
@@ -149,15 +158,15 @@ def accept_senate_agreement(client: requests.Session) -> str:
             "csrfmiddlewaretoken": form_csrf,
             "prohibition_agreement": "1",
         },
-        headers={"Referer": LANDING_URL},
+        headers={"Referer": LANDING_URL, "Origin": ROOT},
         timeout=30,
         allow_redirects=True,
     )
 
-    if accepted.status_code == 403:
-        raise RuntimeError("Senate eFD returned HTTP 403 while accepting the agreement.")
+    check_senate_response(accepted, "while accepting the agreement")
 
-    accepted.raise_for_status()
+    if BeautifulSoup(accepted.text, "lxml").find(attrs={"name": "prohibition_agreement"}):
+        raise SenateAccessError("The Senate agreement form was returned instead of the search page.")
 
     csrf = client.cookies.get("csrftoken") or client.cookies.get("csrf")
 
@@ -165,6 +174,31 @@ def accept_senate_agreement(client: requests.Session) -> str:
         raise RuntimeError("The Senate agreement was accepted, but no CSRF cookie was returned.")
 
     return csrf
+
+
+def establish_senate_session() -> tuple[requests.Session, str]:
+    """Retry authentication with new cookies and a newly fetched form token."""
+    delays = (15, 45)
+    for attempt in range(len(delays) + 1):
+        client = build_session()
+        try:
+            return client, accept_senate_agreement(client)
+        except (SenateAccessError, requests.RequestException) as exc:
+            client.close()
+            retryable = (
+                not isinstance(exc, requests.HTTPError)
+                or exc.response is not None
+                and (exc.response.status_code == 429 or exc.response.status_code >= 500)
+            )
+            if not retryable or attempt == len(delays):
+                raise
+            delay = delays[attempt]
+            print(f"Senate session attempt {attempt + 1} failed: {exc} Retrying in {delay}s.", flush=True)
+            time.sleep(delay)
+        except Exception:
+            client.close()
+            raise
+    raise AssertionError("Unreachable")
 
 
 # ---------------------------------------------------------------------------
@@ -191,16 +225,15 @@ def search_ptr_batch(client: requests.Session, csrf: str, start: int = 0, length
         data=payload,
         headers={
             "Referer": SEARCH_URL,
+            "Origin": ROOT,
+            "Accept": "application/json",
             "X-CSRFToken": csrf,
             "X-Requested-With": "XMLHttpRequest",
         },
         timeout=60,
     )
 
-    if r.status_code == 403:
-        raise RuntimeError("Senate report search returned HTTP 403.")
-
-    r.raise_for_status()
+    check_senate_response(r, "while searching reports")
 
     try:
         return r.json()
@@ -271,11 +304,18 @@ def build_filing_index(session: requests.Session, csrf_token: str) -> pd.DataFra
 
         result = search_ptr_batch(session, csrf_token, start=offset, length=BATCH_SIZE)
 
-        rows = result.get("data", [])
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise RuntimeError("Senate search response is missing its filing data list; keeping existing outputs.")
+        rows = result["data"]
         if not rows:
+            if int(result.get("recordsFiltered", len(filings))) > len(filings):
+                raise RuntimeError("Senate search ended before all filings were returned; keeping existing outputs.")
             break
 
-        filings.extend(parse_search_result(row) for row in rows)
+        parsed_rows = [parse_search_result(row) for row in rows]
+        if any(not row["report_id"] or row["filing_format"] == "unknown" for row in parsed_rows):
+            raise RuntimeError("Senate search returned an unrecognized filing; keeping existing outputs.")
+        filings.extend(parsed_rows)
 
         filtered_total = result.get("recordsFiltered")
         offset += len(rows)
@@ -286,6 +326,8 @@ def build_filing_index(session: requests.Session, csrf_token: str) -> pd.DataFra
             print(f"Found {len(filings)} filings")
 
         if len(rows) < BATCH_SIZE:
+            if filtered_total is not None and offset < int(filtered_total):
+                raise RuntimeError("Senate search returned an incomplete page; keeping existing outputs.")
             break
 
         if filtered_total is not None and offset >= int(filtered_total):
@@ -302,12 +344,12 @@ def build_filing_index(session: requests.Session, csrf_token: str) -> pd.DataFra
 
         filings_df = filings_df.drop_duplicates(subset=["report_key"], keep="first").reset_index(drop=True)
 
-    filings_df.to_csv(FILING_INDEX_CSV, index=False)
+    if filings_df.empty:
+        raise RuntimeError("Senate search returned no filings; keeping existing outputs.")
 
     print()
     print(filings_df["filing_format"].value_counts(dropna=False) if not filings_df.empty else "No filings found")
     print("Total filing rows:", len(filings_df))
-    print("Saved:", FILING_INDEX_CSV)
 
     return filings_df
 
@@ -539,10 +581,7 @@ def scrape_electronic_filings(session: requests.Session, filings_df: pd.DataFram
         try:
             r = session.get(filing["report_url"], headers={"Referer": SEARCH_URL}, timeout=60)
 
-            if r.status_code == 403:
-                raise RuntimeError("HTTP 403")
-
-            r.raise_for_status()
+            check_senate_response(r, "while downloading a filing")
 
             if SAVE_ELECTRONIC_HTML:
                 html_path = RAW_DIR / f"{filing['report_id']}.html"
@@ -592,11 +631,8 @@ def scrape_electronic_filings(session: requests.Session, filings_df: pd.DataFram
     else:
         transactions_df = pd.DataFrame()
 
-    transactions_df.to_csv(TRANSACTIONS_CSV, index=False)
-
     print()
     print("Electronic transactions available:", len(transactions_df))
-    print("Saved:", TRANSACTIONS_CSV)
 
     return transactions_df, electronic_status
 
@@ -662,10 +698,7 @@ def build_status_table(filings_df: pd.DataFrame, transactions_df: pd.DataFrame, 
     assert len(status_df) == len(filings_df)
     assert status_df["report_key"].nunique() == len(filings_df)
 
-    status_df.to_csv(STATUS_CSV, index=False)
-
     print(status_df["status"].value_counts(dropna=False))
-    print("Saved:", STATUS_CSV)
 
     return status_df
 
@@ -677,13 +710,20 @@ def build_status_table(filings_df: pd.DataFrame, transactions_df: pd.DataFrame, 
 def main() -> None:
     print("Filing range:", START_DATE, "through", END_DATE)
 
-    session = build_session()
-    csrf_token = accept_senate_agreement(session)
-    print("Senate eFD session established successfully.")
+    session, csrf_token = establish_senate_session()
+    try:
+        print("Senate eFD session established successfully.")
+        filings_df = build_filing_index(session, csrf_token)
+        transactions_df, electronic_status = scrape_electronic_filings(session, filings_df)
+        status_df = build_status_table(filings_df, transactions_df, electronic_status)
+    finally:
+        session.close()
 
-    filings_df = build_filing_index(session, csrf_token)
-    transactions_df, electronic_status = scrape_electronic_filings(session, filings_df)
-    status_df = build_status_table(filings_df, transactions_df, electronic_status)
+    incomplete = status_df[~status_df["status"].isin(["ok", "ok_reused", "paper_deferred"])]
+    if not incomplete.empty:
+        raise RuntimeError(
+            f"{len(incomplete)} filings failed validation; keeping existing CSVs and metadata for a later retry."
+        )
 
     electronic_filings_count = int((filings_df["filing_format"] == "electronic_html").sum())
     paper_filings_count = int((filings_df["filing_format"] == "paper_scan").sum())
@@ -729,6 +769,11 @@ def main() -> None:
         "status_csv": "data/04_status/senate_ptr_scrape_status.csv",
     }
 
+    # Publish only after every electronic filing has been fetched and validated.
+    # An upstream rejection must not make stale or partial data look fresh.
+    filings_df.to_csv(FILING_INDEX_CSV, index=False)
+    transactions_df.to_csv(TRANSACTIONS_CSV, index=False)
+    status_df.to_csv(STATUS_CSV, index=False)
     METADATA_JSON.write_text(
         json.dumps(metadata, indent=2),
         encoding="utf-8",
