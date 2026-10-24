@@ -60,7 +60,7 @@ START_DATE = os.environ.get("SENATE_PTR_START_DATE") or "2021-01-01"
 END_DATE = os.environ.get("SENATE_PTR_END_DATE") or date.today().isoformat()
 
 BATCH_SIZE = int(os.environ.get("SENATE_PTR_BATCH_SIZE", "100"))
-REQUEST_DELAY = float(os.environ.get("SENATE_PTR_REQUEST_DELAY", "0.40"))
+REQUEST_DELAY = float(os.environ.get("SENATE_PTR_REQUEST_DELAY", "2.0"))
 MAX_SEARCH_PAGES = int(os.environ.get("SENATE_PTR_MAX_SEARCH_PAGES", "500"))
 
 # Save the official HTML page for each electronic PTR.
@@ -177,14 +177,18 @@ def accept_senate_agreement(client: requests.Session) -> str:
 
 
 def establish_senate_session() -> tuple[requests.Session, str]:
-    """Retry authentication with new cookies and a newly fetched form token."""
-    delays = (15, 45)
+    """Retry network failures gently; leave source denials for a later run."""
+    delays = (60,)
     for attempt in range(len(delays) + 1):
         client = build_session()
         try:
             return client, accept_senate_agreement(client)
         except (SenateAccessError, requests.RequestException) as exc:
             client.close()
+            # A denied session needs a long cooldown, not another immediate POST.
+            # The recovery workflow considers one later retry after at least 6h.
+            if isinstance(exc, SenateAccessError):
+                raise
             retryable = (
                 not isinstance(exc, requests.HTTPError)
                 or exc.response is not None
@@ -601,6 +605,10 @@ def scrape_electronic_filings(session: requests.Session, filings_df: pd.DataFram
 
             print(f"[{i + 1}/{len(to_scrape)}] {filing['filer_name']} | {len(rows)} transactions")
 
+        except SenateAccessError:
+            # Stop the entire run after a source denial rather than requesting
+            # every remaining filing from a session that has just been blocked.
+            raise
         except Exception as exc:
             electronic_status.append(
                 {

@@ -26,34 +26,37 @@ def session(token="fresh", post_status=200):
 
 
 class AgreementTests(unittest.TestCase):
-    def test_source_403_recovers_with_new_session_and_token(self):
+    def test_source_403_waits_for_later_recovery_instead_of_retrying(self):
         rejected = session("old", 403)
         accepted = session("new")
-        with patch.object(scraper, "build_session", side_effect=[rejected, accepted]), patch.object(scraper.time, "sleep") as sleep:
-            client, token = scraper.establish_senate_session()
-        self.assertIs(client, accepted)
-        self.assertEqual(token, "new")
-        rejected.close.assert_called_once()
-        accepted.close.assert_not_called()
-        sleep.assert_called_once_with(15)
-        self.assertEqual(accepted.post.call_args.kwargs["data"]["csrfmiddlewaretoken"], "new")
-        self.assertEqual(accepted.post.call_args.kwargs["headers"]["Origin"], scraper.ROOT)
-
-    def test_persistent_403_stops_after_three_sessions(self):
-        clients = [session(post_status=403) for _ in range(3)]
-        with patch.object(scraper, "build_session", side_effect=clients) as build, patch.object(scraper.time, "sleep") as sleep:
-            with self.assertRaisesRegex(scraper.SenateAccessError, "HTTP 403"):
+        with patch.object(scraper, "build_session", side_effect=[rejected, accepted]) as build, patch.object(scraper.time, "sleep") as sleep:
+            with self.assertRaises(scraper.SenateAccessError):
                 scraper.establish_senate_session()
-        self.assertEqual(build.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 45])
+        build.assert_called_once()
+        rejected.close.assert_called_once()
+        accepted.post.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_persistent_network_failure_stops_after_two_sessions(self):
+        clients = [session() for _ in range(2)]
+        for client in clients:
+            client.get.side_effect = requests.Timeout("source timeout")
+        with patch.object(scraper, "build_session", side_effect=clients) as build, patch.object(scraper.time, "sleep") as sleep:
+            with self.assertRaises(requests.Timeout):
+                scraper.establish_senate_session()
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [60])
         for client in clients:
             client.close.assert_called_once()
 
     def test_network_timeout_recovers(self):
         rejected, accepted = session(), session()
         rejected.get.side_effect = requests.Timeout("source timeout")
-        with patch.object(scraper, "build_session", side_effect=[rejected, accepted]), patch.object(scraper.time, "sleep"):
+        with patch.object(scraper, "build_session", side_effect=[rejected, accepted]), patch.object(scraper.time, "sleep") as sleep:
             self.assertIs(scraper.establish_senate_session()[0], accepted)
+        sleep.assert_called_once_with(60)
+        self.assertEqual(accepted.post.call_args.kwargs["data"]["csrfmiddlewaretoken"], "fresh")
+        self.assertEqual(accepted.post.call_args.kwargs["headers"]["Origin"], scraper.ROOT)
 
     def test_non_retryable_http_error_fails_immediately(self):
         client = session(post_status=404)
@@ -87,6 +90,18 @@ class AgreementTests(unittest.TestCase):
 
 
 class OutputProtectionTests(unittest.TestCase):
+    def test_filing_403_stops_remaining_requests(self):
+        client = Mock()
+        client.get.return_value = response(403)
+        filings = pd.DataFrame([
+            {"report_id": str(i), "filing_format": "electronic_html", "report_url": "https://example.com/ptr/", "filer_name": "Test"}
+            for i in range(2)
+        ])
+        with patch.object(scraper, "RESUME_EXISTING", False), patch.object(scraper.time, "sleep"):
+            with self.assertRaises(scraper.SenateAccessError):
+                scraper.scrape_electronic_filings(client, filings)
+        client.get.assert_called_once()
+
     def test_invalid_or_empty_search_keeps_existing_index(self):
         for payload in [{}, {"data": {}}, {"data": []}, {"data": [], "recordsFiltered": 100}]:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
