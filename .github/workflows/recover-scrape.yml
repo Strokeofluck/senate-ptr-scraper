@@ -1,28 +1,24 @@
 name: Recover failed Senate scrape
 
 on:
-  workflow_run:
-    workflows: [Scrape Senate PTRs]
-    types: [completed]
+  schedule:
+    # Check in the evening, roughly half a day after the daily scrape.
+    # The script also enforces at least six hours since the failed run.
+    - cron: '30 1 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: recover-senate-${{ github.event.workflow_run.id }}
+  group: recover-senate
   cancel-in-progress: false
 
 jobs:
   recover:
-    if: >-
-      github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      (github.event.workflow_run.event == 'schedule' ||
-       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:

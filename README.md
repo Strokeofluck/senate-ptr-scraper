@@ -46,9 +46,10 @@ It runs daily at approximately **9:30 AM U.S. Eastern**, installs the Python req
 
 The workflow also supports manual date-range overrides.
 
-Failed scraper steps automatically receive up to two additional runner attempts,
-after 2-minute and 10-minute cooldowns. Recovery only applies to scheduled or manual
-runs on `main`; commit/push and portfolio-rebuild failures are left for inspection.
+An evening recovery check runs at **01:30 UTC**, roughly half a day after the daily
+scrape. It allows one additional runner attempt only when the latest scrape failed
+at least six hours ago and within the past day. Recovery only applies to scheduled
+or manual runs on `main`; commit/push and portfolio-rebuild failures are left for inspection.
 Concurrent data updates are serialized. Manual runs on other branches can validate
 the scraper without committing data or requesting a portfolio rebuild.
 
@@ -89,7 +90,7 @@ Example:
 
 ```powershell
 $env:SENATE_PTR_START_DATE="2025-01-01"
-$env:SENATE_PTR_REQUEST_DELAY="0.75"
+$env:SENATE_PTR_REQUEST_DELAY="2.0"
 python scripts/scrape_senate_ptrs.py
 ```
 
@@ -107,15 +108,18 @@ Keeping those records in the index makes the gap explicit instead of silently ex
 
 The scraper keeps the official HTML for electronic filings so parsed records can be checked against the source.
 
-Requests include retry handling and a configurable delay between calls. Agreement
+Requests include retry handling and a configurable delay between calls (two seconds
+by default). Agreement
 requests send the source Origin and Referer headers, and fetch the form without
-using a cached response. An HTTP 403 or temporary network failure during agreement
-acceptance triggers up to three attempts with fresh sessions and fresh CSRF tokens,
-with 15-second and 45-second delays. Persistent rejection still fails visibly.
+using a cached response. An HTTP 403 stops the entire scrape immediately, including
+when downloading filings, to give the source time to recover. Temporary network failures allow one fresh-session retry
+after a full minute. Persistent rejection still fails visibly.
 
 The separate `.github/workflows/recover-scrape.yml` workflow retries failed scraper
-jobs on fresh GitHub-hosted runners, with a maximum of three total runner attempts
-per run. It rechecks the run after its cooldown to avoid duplicating a manual retry.
+jobs on fresh GitHub-hosted runners, with a maximum of two total runner attempts
+per run and a minimum six-hour cooldown. It checks the latest scrape and rechecks
+the run before retrying to avoid duplicating a manual retry. The scheduled check
+does not keep a runner waiting through the cooldown.
 This workflow must be on the default branch to run. It requires only read access to
 contents and write access to Actions, and executes only trusted default-branch code.
 
