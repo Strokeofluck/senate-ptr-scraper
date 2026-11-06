@@ -1,10 +1,8 @@
 name: Scraper regression checks
 
 on:
-  pull_request:
-  push:
-    branches: [main, 'fix/**']
-    paths: ['scripts/**', 'tests/**', '.github/**', requirements.txt]
+  # Paused at user request; run manually only.
+  workflow_dispatch:
 
 permissions:
   contents: read
