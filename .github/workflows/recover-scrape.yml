@@ -1,10 +1,8 @@
 name: Recover failed Senate scrape
 
 on:
-  schedule:
-    # Check in the evening, roughly half a day after the daily scrape.
-    # The script also enforces at least six hours since the failed run.
-    - cron: '30 1 * * *'
+  # Automatic runs paused: Senate eFD rejects hosted requests with HTTP 403.
+  # Resume scheduling only after source access has been restored and verified.
   workflow_dispatch:
 
 permissions:
